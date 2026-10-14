@@ -1,4 +1,3 @@
-
 import streamlit as st
 import yfinance as yf
 import pandas as pd
@@ -28,12 +27,13 @@ st.caption(
 
 
 # ============================================================
-# STOCK DATA
+# HISTORICAL STOCK DATA
 # ============================================================
 
 @st.cache_data(ttl=900)
 def load_data(symbol, period):
     ticker = yf.Ticker(symbol)
+
     data = ticker.history(
         period=period,
         interval="1d",
@@ -42,17 +42,23 @@ def load_data(symbol, period):
 
     if data is None or data.empty:
         raise ValueError(
-            f"No historical price data was returned for {symbol}. "
+            f"No historical data was returned for {symbol}. "
             "Check the ticker symbol and try again."
         )
 
-    required = ["Open", "High", "Low", "Close", "Volume"]
-    missing = [col for col in required if col not in data.columns]
+    required_columns = [
+        "Open", "High", "Low", "Close", "Volume"
+    ]
+
+    missing = [
+        column for column in required_columns
+        if column not in data.columns
+    ]
 
     if missing:
         raise ValueError(f"Missing data columns: {missing}")
 
-    data = data[required].copy()
+    data = data[required_columns].copy()
     data = data[~data.index.duplicated(keep="last")]
     data = data.sort_index()
     data = data.replace([np.inf, -np.inf], np.nan)
@@ -60,7 +66,7 @@ def load_data(symbol, period):
 
     if len(data) < 60:
         raise ValueError(
-            "There is not enough historical data to build a useful model. "
+            "Not enough historical observations. "
             "Try a longer historical period."
         )
 
@@ -74,9 +80,11 @@ def load_data(symbol, period):
 @st.cache_data(ttl=300)
 def load_news(symbol):
     """
-    Retrieve news while accommodating multiple Yahoo Finance
-    response formats. Return diagnostics instead of hiding errors.
+    Retrieve news using the yfinance Search object's .news property.
+    Returns articles, error message, query, and diagnostic information.
     """
+
+    symbol = symbol.strip().upper()
 
     company_names = {
         "NVDA": "NVIDIA",
@@ -111,18 +119,12 @@ def load_news(symbol):
         "PYPL": "PayPal",
     }
 
-    symbol = symbol.upper().strip()
     company = company_names.get(symbol, "")
-    query = (
-        f"{symbol} {company} stock news"
-        if company
-        else f"{symbol} stock news"
-    )
+    query = f"{symbol} {company}".strip()
 
     diagnostics = {
         "query": query,
         "response_type": "Not received",
-        "response_keys": [],
         "article_count": 0,
         "first_article_keys": [],
         "first_article_sample": None,
@@ -135,80 +137,40 @@ def load_news(symbol):
             max_results=10
         )
 
-        # Different yfinance versions expose results differently.
-        response = None
-        errors = []
+        # IMPORTANT:
+        # Read the news property directly instead of treating
+        # the Search object as a dictionary.
+        articles = search.news
 
-        try:
-            response = search.search()
-        except Exception as exc:
-            errors.append(
-                f"search.search(): {type(exc).__name__}: {exc}"
-            )
+        diagnostics["response_type"] = type(articles).__name__
 
-        articles = []
-
-        if isinstance(response, dict):
-            diagnostics["response_type"] = "dict"
-            diagnostics["response_keys"] = list(response.keys())
-
-            possible_articles = response.get("news", [])
-            if isinstance(possible_articles, list):
-                articles = possible_articles
-
-        elif isinstance(response, list):
-            diagnostics["response_type"] = "list"
-            articles = response
-
-        elif response is not None:
-            diagnostics["response_type"] = type(response).__name__
-
-            possible_articles = getattr(response, "news", None)
-            if isinstance(possible_articles, list):
-                articles = possible_articles
-
-        # Some versions expose the news directly on the Search object.
-        if not articles:
-            possible_articles = getattr(search, "news", None)
-
-            if isinstance(possible_articles, list):
-                articles = possible_articles
+        if not isinstance(articles, list):
+            articles = []
 
         diagnostics["article_count"] = len(articles)
 
-        if articles:
-            first = articles[0]
+        if articles and isinstance(articles[0], dict):
+            diagnostics["first_article_keys"] = list(
+                articles[0].keys()
+            )
 
-            if isinstance(first, dict):
-                diagnostics["first_article_keys"] = list(first.keys())
-                diagnostics["first_article_sample"] = {
-                    key: first.get(key)
-                    for key in list(first.keys())[:8]
-                }
+            diagnostics["first_article_sample"] = {
+                key: value
+                for key, value in list(articles[0].items())[:8]
+            }
 
         results = []
         seen_links = set()
 
-        def extract_url(value):
-            if isinstance(value, str):
-                return value
-
-            if isinstance(value, dict):
-                for key in ("url", "href"):
-                    candidate = value.get(key)
-                    if isinstance(candidate, str):
-                        return candidate
-
-            return ""
-
-        for original_article in articles:
-            if not isinstance(original_article, dict):
+        for original in articles:
+            if not isinstance(original, dict):
                 continue
 
-            article = dict(original_article)
+            article = dict(original)
 
-            # Some Yahoo responses nest fields under "content".
+            # Some response formats nest the article fields.
             content = article.get("content")
+
             if isinstance(content, dict):
                 article = {**article, **content}
 
@@ -218,15 +180,32 @@ def load_news(symbol):
                 or ""
             ).strip()
 
-            link = (
-                extract_url(article.get("link"))
-                or extract_url(article.get("canonicalUrl"))
-                or extract_url(article.get("clickThroughUrl"))
-                or extract_url(article.get("url"))
-            )
+            # Extract a URL from common response formats.
+            link = article.get("link") or ""
 
-            # Only show actual article links.
-            if not title or not link.startswith(("https://", "http://")):
+            if isinstance(link, dict):
+                link = link.get("url", "")
+
+            if not link:
+                canonical = article.get("canonicalUrl")
+
+                if isinstance(canonical, dict):
+                    link = canonical.get("url", "")
+                elif isinstance(canonical, str):
+                    link = canonical
+
+            if not link:
+                click_url = article.get("clickThroughUrl")
+
+                if isinstance(click_url, dict):
+                    link = click_url.get("url", "")
+                elif isinstance(click_url, str):
+                    link = click_url
+
+            if not title or not isinstance(link, str):
+                continue
+
+            if not link.startswith(("https://", "http://")):
                 continue
 
             if link in seen_links:
@@ -234,12 +213,13 @@ def load_news(symbol):
 
             seen_links.add(link)
 
-            # Published date can be a timestamp or a text value.
+            # Published date.
             published = (
                 article.get("providerPublishTime")
                 or article.get("pubDate")
                 or article.get("displayTime")
                 or article.get("published")
+                or "Date unavailable"
             )
 
             if isinstance(published, (int, float)):
@@ -250,42 +230,39 @@ def load_news(symbol):
                     ).strftime("%Y-%m-%d %H:%M UTC")
                 except (ValueError, OSError, OverflowError):
                     published = "Date unavailable"
-            elif not published:
-                published = "Date unavailable"
-            else:
-                published = str(published)
 
+            # Publisher.
             provider = article.get("provider")
+
             if isinstance(provider, dict):
                 publisher = (
                     provider.get("displayName")
                     or provider.get("name")
+                    or "News source"
                 )
             else:
                 publisher = (
-                    provider
-                    or article.get("publisher")
+                    article.get("publisher")
+                    or provider
                     or article.get("source")
+                    or "News source"
                 )
 
             results.append({
                 "title": title,
-                "publisher": str(publisher or "Unknown source"),
+                "publisher": str(publisher),
                 "link": link,
-                "published": published,
+                "published": str(published),
             })
 
         error = None
 
         if not results:
             error = (
-                "Yahoo Finance returned no usable headlines. "
-                "The endpoint may have returned no articles, "
-                "or its response format may have changed."
+                "The search returned no usable article links. "
+                "Yahoo Finance may have returned no articles, "
+                "or the response format may differ from expected."
             )
-
-            if errors:
-                error += " Retrieval detail: " + " | ".join(errors)
 
         return results, error, query, diagnostics
 
@@ -304,16 +281,18 @@ def load_news(symbol):
 
 def make_features(data):
     """
-    Create features using historical information only.
-    The target is the next trading day's return.
+    Construct lagged features from historical data.
+    The target is the next observed trading day's return.
     """
 
     frame = data.copy()
+
     close = frame["Close"].astype(float)
     volume = frame["Volume"].astype(float)
 
     returns = close.pct_change(fill_method=None)
 
+    # Lagged daily returns.
     frame["return_1"] = returns.shift(1)
     frame["return_2"] = returns.shift(2)
     frame["return_3"] = returns.shift(3)
@@ -321,30 +300,34 @@ def make_features(data):
     frame["return_10"] = returns.shift(10)
     frame["return_20"] = returns.shift(20)
 
-    frame["momentum_5"] = close.pct_change(
-        5, fill_method=None
-    ).shift(1)
+    # Historical momentum.
+    frame["momentum_5"] = (
+        close.pct_change(5, fill_method=None).shift(1)
+    )
+    frame["momentum_10"] = (
+        close.pct_change(10, fill_method=None).shift(1)
+    )
+    frame["momentum_20"] = (
+        close.pct_change(20, fill_method=None).shift(1)
+    )
 
-    frame["momentum_10"] = close.pct_change(
-        10, fill_method=None
-    ).shift(1)
+    # Historical volatility.
+    frame["volatility_5"] = (
+        returns.rolling(5).std().shift(1)
+    )
+    frame["volatility_20"] = (
+        returns.rolling(20).std().shift(1)
+    )
 
-    frame["momentum_20"] = close.pct_change(
-        20, fill_method=None
-    ).shift(1)
+    # Volume-derived features.
+    frame["volume_change"] = (
+        volume.pct_change(fill_method=None).shift(1)
+    )
+    frame["volume_change_5"] = (
+        volume.pct_change(5, fill_method=None).shift(1)
+    )
 
-    frame["volatility_5"] = returns.rolling(5).std().shift(1)
-    frame["volatility_20"] = returns.rolling(20).std().shift(1)
-
-    frame["volume_change"] = volume.pct_change(
-        fill_method=None
-    ).shift(1)
-
-    frame["volume_change_5"] = volume.pct_change(
-        5, fill_method=None
-    ).shift(1)
-
-    # Today's features predict the following trading day's return.
+    # Predict the next observed daily return.
     frame["target"] = returns.shift(-1)
 
     frame = frame.replace([np.inf, -np.inf], np.nan)
@@ -353,11 +336,10 @@ def make_features(data):
 
 
 # ============================================================
-# TRAIN MODEL AND FORECAST
+# MODEL TRAINING AND FORECASTING
 # ============================================================
 
 def train_and_forecast(data, horizon):
-    feature_frame = make_features(data)
 
     feature_columns = [
         "return_1",
@@ -375,27 +357,27 @@ def train_and_forecast(data, horizon):
         "volume_change_5",
     ]
 
-    # Rows with no target cannot be used for model training.
+    feature_frame = make_features(data)
+
     training_data = feature_frame.dropna(
         subset=feature_columns + ["target"]
     )
 
     if len(training_data) < 40:
         raise ValueError(
-            "There are not enough complete feature rows to train "
-            "the model. Try selecting a longer historical period."
+            "Not enough complete observations to train the model. "
+            "Select a longer historical period."
         )
 
     X = training_data[feature_columns]
     y = training_data["target"]
 
-    # Chronological split: never randomly shuffle time-series rows.
+    # Chronological split. Do not shuffle time-series data.
     split_index = int(len(training_data) * 0.8)
 
     if split_index < 20 or len(training_data) - split_index < 5:
         raise ValueError(
-            "There are too few rows for a reliable chronological "
-            "training and evaluation split."
+            "Not enough observations for the training and testing split."
         )
 
     X_train = X.iloc[:split_index]
@@ -413,15 +395,19 @@ def train_and_forecast(data, horizon):
     )
 
     evaluation_model.fit(X_train, y_train)
+
     test_predictions = evaluation_model.predict(X_test)
 
-    mae = mean_absolute_error(y_test, test_predictions)
+    mae = mean_absolute_error(
+        y_test,
+        test_predictions
+    )
 
     directional_accuracy = np.mean(
         np.sign(test_predictions) == np.sign(y_test.to_numpy())
     )
 
-    # Retrain on all available labeled observations for forecasting.
+    # Retrain using all labeled observations.
     model = RandomForestRegressor(
         n_estimators=200,
         max_depth=5,
@@ -432,25 +418,27 @@ def train_and_forecast(data, horizon):
 
     model.fit(X, y)
 
-    # Keep only price and volume history for recursive predictions.
-    history = data[["Open", "High", "Low", "Close", "Volume"]].copy()
+    # Begin recursive forecasting from the available historical data.
+    history = data[
+        ["Open", "High", "Low", "Close", "Volume"]
+    ].copy()
 
-    forecasts = []
     current_price = float(history["Close"].iloc[-1])
-
     last_date = history.index[-1]
 
-    # Preserve the index's timezone, if it has one.
-    for day in range(1, horizon + 1):
-        future_features = make_features(history)
+    forecasts = []
 
-        latest_features = future_features[
+    for step in range(1, horizon + 1):
+
+        feature_frame = make_features(history)
+
+        latest_features = feature_frame[
             feature_columns
         ].iloc[[-1]]
 
         if latest_features.isna().to_numpy().any():
             raise ValueError(
-                "The latest row has missing model features. "
+                "The latest row contains missing features. "
                 "Try a longer historical period."
             )
 
@@ -458,13 +446,12 @@ def train_and_forecast(data, horizon):
             model.predict(latest_features)[0]
         )
 
-        # Guard against non-finite model output.
         if not np.isfinite(predicted_return):
             raise ValueError(
-                "The model returned an invalid prediction."
+                "The model generated an invalid return prediction."
             )
 
-        # Avoid runaway numerical values in recursive forecasts.
+        # Prevent extreme numerical predictions from cascading.
         predicted_return = float(
             np.clip(predicted_return, -0.5, 0.5)
         )
@@ -473,11 +460,10 @@ def train_and_forecast(data, horizon):
 
         if not np.isfinite(predicted_price) or predicted_price <= 0:
             raise ValueError(
-                "The model generated an invalid future price."
+                "The model generated an invalid predicted price."
             )
 
-        # Business-day dates are an approximation, not an exchange
-        # calendar; market holidays are not explicitly handled.
+        # Business-day approximation; exchange holidays are not excluded.
         future_date = last_date + pd.offsets.BDay(1)
 
         forecasts.append({
@@ -486,8 +472,7 @@ def train_and_forecast(data, horizon):
             "Predicted Return": predicted_return,
         })
 
-        # Append the predicted price so the next step can be recursive.
-        # Future volume is carried forward as a placeholder.
+        # Volume is carried forward as a placeholder for future dates.
         last_volume = float(history["Volume"].iloc[-1])
 
         new_row = pd.DataFrame(
@@ -508,11 +493,16 @@ def train_and_forecast(data, horizon):
 
     forecast_df = pd.DataFrame(forecasts).set_index("Date")
 
-    return forecast_df, mae, directional_accuracy, len(training_data)
+    return (
+        forecast_df,
+        mae,
+        directional_accuracy,
+        len(training_data)
+    )
 
 
 # ============================================================
-# SIDEBAR CONTROLS
+# SIDEBAR
 # ============================================================
 
 st.sidebar.header("⚙️ Analysis settings")
@@ -533,41 +523,31 @@ period_options = {
 
 period_label = st.sidebar.selectbox(
     "Historical period",
-    list(period_options.keys()),
+    options=list(period_options.keys()),
     index=2
 )
 
 period = period_options[period_label]
 
 horizon = st.sidebar.selectbox(
-    "Forecast horizon (trading days)",
-    [5, 10, 20],
-    index=1
+    "Forecast horizon",
+    options=[5, 10, 20],
+    index=1,
+    format_func=lambda days: f"{days} trading days"
 )
 
 show_diagnostics = st.sidebar.checkbox(
     "Show news diagnostics",
-    value=True,
-    help="Shows response details if the news provider returns no usable articles."
+    value=True
 )
 
-run_analysis = st.sidebar.button(
-    "Run analysis",
-    type="primary",
-    use_container_width=True
-)
-
-# The button is provided for clarity; the app also runs on initial load.
-if "analysis_requested" not in st.session_state:
-    st.session_state.analysis_requested = True
-
-if run_analysis:
+if st.sidebar.button("Refresh data", type="primary"):
     st.cache_data.clear()
-    st.session_state.analysis_requested = True
+    st.rerun()
 
 
 # ============================================================
-# MAIN APPLICATION
+# MAIN APP
 # ============================================================
 
 if not ticker:
@@ -575,6 +555,11 @@ if not ticker:
     st.stop()
 
 try:
+
+    # --------------------------------------------------------
+    # LOAD DATA
+    # --------------------------------------------------------
+
     with st.spinner(f"Loading historical data for {ticker}..."):
         data = load_data(ticker, period)
 
@@ -615,16 +600,16 @@ try:
 
     col4.metric(
         "Forecast horizon",
-        f"{horizon} trading days"
+        f"{horizon} days"
     )
 
     st.caption(
-        "Prices use Yahoo Finance's adjusted historical data. "
-        "The latest available observation may not be today's price."
+        "Historical prices are adjusted for relevant corporate actions. "
+        "The latest observation may not be today's live market price."
     )
 
     # --------------------------------------------------------
-    # HISTORICAL PRICE CHART
+    # HISTORICAL CHART
     # --------------------------------------------------------
 
     st.subheader("📈 Historical price")
@@ -660,7 +645,7 @@ try:
         )
 
     # --------------------------------------------------------
-    # NEWS
+    # NEWS SECTION
     # --------------------------------------------------------
 
     st.divider()
@@ -669,34 +654,47 @@ try:
     with st.spinner("Retrieving recent news..."):
         news, news_error, news_query, diagnostics = load_news(ticker)
 
-    st.caption(f"News search query: {news_query}")
+    st.caption(f"Search query: {news_query}")
 
     if news:
+
         for article in news[:10]:
-            st.markdown(f"**[{article['title']}]({article['link']})**")
+
+            st.markdown(
+                f"**[{article['title']}]({article['link']})**"
+            )
+
             st.caption(
                 f"{article['publisher']} · {article['published']}"
             )
+
             st.divider()
+
     else:
+
         st.info(
-            "The news provider returned no usable headlines. "
-            "Stock analysis can continue below."
+            "No usable headlines were returned. "
+            "Stock analysis and forecasting can continue below."
         )
 
         if news_error:
-            st.caption(f"Retrieval detail: {news_error}")
+            st.caption(f"News retrieval detail: {news_error}")
 
         if show_diagnostics:
-            with st.expander("News diagnostics", expanded=True):
+
+            with st.expander(
+                "News diagnostics",
+                expanded=True
+            ):
+
                 st.write(
-                    "**Response type:**",
-                    diagnostics.get("response_type", "Unknown")
+                    "**Search query:**",
+                    diagnostics.get("query", "")
                 )
 
                 st.write(
-                    "**Response keys:**",
-                    diagnostics.get("response_keys", [])
+                    "**Response type:**",
+                    diagnostics.get("response_type", "Unknown")
                 )
 
                 st.write(
@@ -716,24 +714,27 @@ try:
                     st.json(sample)
 
                 st.caption(
-                    "If zero articles were received, the provider may be "
-                    "unavailable or the installed yfinance version may "
-                    "behave differently. If articles were received but "
-                    "none were displayed, inspect the sample for the "
-                    "actual headline and URL fields."
+                    "If no articles were received, Yahoo Finance may "
+                    "have returned an empty result or restricted access. "
+                    "If articles were received but none appeared, the "
+                    "sample can help identify the correct field names."
                 )
 
     # --------------------------------------------------------
-    # MODEL AND FORECAST
+    # FORECAST
     # --------------------------------------------------------
 
     st.divider()
     st.subheader("🤖 Machine-learning forecast")
 
-    with st.spinner("Training the Random Forest model..."):
-        forecast_df, mae, directional_accuracy, training_rows = (
-            train_and_forecast(data, horizon)
-        )
+    with st.spinner("Training and evaluating the Random Forest model..."):
+
+        (
+            forecast_df,
+            mae,
+            directional_accuracy,
+            training_rows
+        ) = train_and_forecast(data, horizon)
 
     metric1, metric2, metric3 = st.columns(3)
 
@@ -743,7 +744,7 @@ try:
     )
 
     metric2.metric(
-        "Test directional accuracy",
+        "Directional accuracy",
         f"{directional_accuracy:.1%}"
     )
 
@@ -753,10 +754,10 @@ try:
     )
 
     st.caption(
-        "MAE is measured in daily returns, not dollars. "
-        "Directional accuracy is the share of held-out observations "
-        "where the predicted return and actual return have the same sign. "
-        "Neither metric guarantees future performance."
+        "MAE measures average absolute prediction error in daily returns. "
+        "Directional accuracy measures how often predicted and actual "
+        "returns have the same sign on the held-out test set. "
+        "These historical metrics do not guarantee future accuracy."
     )
 
     # --------------------------------------------------------
@@ -767,8 +768,9 @@ try:
 
     forecast_fig = go.Figure()
 
-    # Display recent history for context.
-    recent_history = data.tail(min(90, len(data)))
+    recent_history = data.tail(
+        min(90, len(data))
+    )
 
     forecast_fig.add_trace(
         go.Scatter(
@@ -780,7 +782,6 @@ try:
         )
     )
 
-    # Connect the last historical observation to the forecast.
     connecting_dates = [
         data.index[-1],
         *forecast_df.index.tolist()
@@ -821,7 +822,6 @@ try:
     st.subheader("Forecast values")
 
     display_forecast = forecast_df.copy()
-
     display_forecast.index.name = "Forecast date"
 
     display_forecast["Predicted Price"] = (
@@ -842,28 +842,28 @@ try:
     )
 
     # --------------------------------------------------------
-    # IMPORTANT LIMITATIONS
+    # LIMITATIONS
     # --------------------------------------------------------
 
     st.warning(
-        "**Important limitations:** This is an experimental educational "
-        "model, not a reliable prediction of future market prices. "
-        "It uses historical price and volume-derived features and does "
-        "not incorporate financial statements, news sentiment, economic "
-        "conditions, or other external factors. Multi-day forecasts are "
-        "recursive, so prediction errors can accumulate. Future volume "
-        "is carried forward as a placeholder. The model's test metrics "
-        "do not measure certainty about future forecasts."
+        "**Model limitations:** This is an experimental educational "
+        "forecast, not a reliable prediction of future market prices. "
+        "The model uses historical price and volume-derived features. "
+        "It does not include company fundamentals, news sentiment, "
+        "economic conditions, or other external factors. Multi-day "
+        "forecasts are recursive, so errors can accumulate. Future "
+        "volume is carried forward as a placeholder, and forecast dates "
+        "use business days rather than an exchange-specific calendar."
     )
 
 except Exception as exc:
+
     st.error(
         f"Unable to complete the analysis for {ticker}: "
         f"{type(exc).__name__}: {exc}"
     )
 
     st.info(
-        "Check the ticker symbol, confirm that the app has internet "
-        "access, and try again. If the issue persists, inspect the "
-        "Streamlit app logs."
+        "Check the ticker symbol and try again. If the problem persists, "
+        "review the Streamlit app logs for more details."
     )
