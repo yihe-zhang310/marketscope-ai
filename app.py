@@ -75,20 +75,54 @@ def load_data(symbol, period):
 
 
 
-@st.cache_data(ttl=60)
+
+@st.cache_data(ttl=300)
 def load_news(symbol):
-    """Retrieve news headlines from Yahoo Finance."""
+    """Retrieve and filter news for the selected company."""
+
+    # Common company names for frequently searched tickers.
+    company_names = {
+        "NVDA": "NVIDIA",
+        "AAPL": "Apple",
+        "MSFT": "Microsoft",
+        "GOOGL": "Alphabet Google",
+        "GOOG": "Alphabet Google",
+        "AMZN": "Amazon",
+        "META": "Meta",
+        "TSLA": "Tesla",
+        "AMD": "AMD",
+        "INTC": "Intel",
+        "NFLX": "Netflix",
+        "AVGO": "Broadcom",
+        "ORCL": "Oracle",
+        "CRM": "Salesforce",
+        "JPM": "JPMorgan",
+        "WMT": "Walmart",
+        "DIS": "Disney",
+        "COST": "Costco",
+        "PLTR": "Palantir",
+        "SMCI": "Super Micro Computer",
+    }
+
+    company_name = company_names.get(symbol, "")
+
+    # Search using the ticker and, when known, company name.
+    query = (
+        f"{symbol} {company_name} stock news"
+        if company_name
+        else f"{symbol} stock news"
+    )
 
     try:
         search = yf.Search(
-            symbol,
-            news_count=20,
+            query,
+            news_count=30,
             max_results=10
         )
 
         search_results = search.search()
 
-        # Handle either a dictionary or an object response.
+        # Accommodate different yfinance response types.
         if isinstance(search_results, dict):
             articles = search_results.get("news", []) or []
         else:
@@ -97,18 +131,49 @@ def load_news(symbol):
             ) or []
 
         results = []
+        seen_links = set()
+        rejected_count = 0
 
         for article in articles:
             title = article.get("title", "")
             link = article.get("link", "")
-            publisher = article.get(
-                "publisher", "Unknown source"
-            )
 
             if not title or not link:
+                rejected_count += 1
                 continue
 
             if not link.startswith("https://"):
+                rejected_count += 1
+                continue
+
+            # Filter obvious duplicates.
+            if link in seen_links:
+                continue
+
+            seen_links.add(link)
+
+            # Check whether the headline mentions the ticker
+            # or the known company name.
+            headline = title.casefold()
+            ticker_mentioned = (
+                symbol.casefold() in headline.split()
+            )
+
+            company_mentioned = (
+                bool(company_name)
+                and any(
+                    name.casefold() in headline
+                    for name in company_name.split()
+                    if len(name) > 2
+                )
+            )
+
+            # Unknown tickers are not aggressively filtered:
+            # without a company-name mapping, relevance is uncertain.
+            if company_name and not (
+                ticker_mentioned or company_mentioned
+            ):
+                rejected_count += 1
                 continue
 
             published = article.get("providerPublishTime")
@@ -123,20 +188,28 @@ def load_news(symbol):
                     published = "Date unavailable"
             else:
                 published = article.get(
-                    "pubDate", "Date unavailable"
+                    "pubDate",
+                    "Date unavailable"
                 )
 
             results.append({
                 "title": title,
-                "publisher": publisher,
+                "publisher": article.get(
+                    "publisher", "Unknown source"
+                ),
                 "link": link,
                 "published": published
             })
 
-        return results, None
+        return results, None, rejected_count, query
 
     except Exception as e:
-        return [], f"{type(e).__name__}: {e}"
+        return (
+            [],
+            f"{type(e).__name__}: {e}",
+            0,
+            query
+        )
 
 
 
@@ -375,53 +448,43 @@ try:
         f"{len(data):,}"
     )
 
-    # -------------------------
-    # Recent news
-    # -------------------------
-    st.subheader(f"📰 Recent news search: {ticker}")
+   
+# -------------------------
+# Recent company news
+# -------------------------
+st.subheader(f"📰 Recent news: {ticker}")
 
-    with st.spinner("Searching Yahoo Finance news..."):
-        news_items, news_error = load_news(ticker)
+with st.spinner("Searching for relevant headlines..."):
+    news_items, news_error, rejected_count, news_query = (
+        load_news(ticker)
+    )
 
-    if news_error:
+if news_error:
+    st.warning(f"News retrieval error: {news_error}")
 
-        # Temporary diagnostic message:
-        # Shows the actual exception instead of hiding it.
-        st.warning(
-            f"News retrieval error: {news_error}"
-        )
+elif not news_items:
+    st.info(
+        "No headlines passed the relevance filter. "
+        "Try another ticker or check again later."
+    )
+    st.caption(f"Search query: {news_query}")
 
-    elif not news_items:
+else:
+    st.caption(
+        f"Showing {len(news_items)} potentially relevant "
+        f"headlines. Filtered out {rejected_count} "
+        "unrelated or unusable results."
+    )
 
-        st.info(
-            "The search completed, but no usable headlines "
-            "were returned."
-        )
-
-    else:
-
-        st.caption(
-            f"{len(news_items)} available headlines. "
-            "Some results may concern related companies "
-            "or broader markets."
-        )
-
-        for item in news_items:
-
-            with st.container(border=True):
-
-                st.markdown(
-                    f"**{item['title']}**"
-                )
-
-                st.caption(
-                    f"{item['publisher']} · "
-                    f"{item['published']}"
-                )
-
-                st.markdown(
-                    f"[Read original article]({item['link']})"
-                )
+    for item in news_items:
+        with st.container(border=True):
+            st.markdown(f"**{item['title']}**")
+            st.caption(
+                f"{item['publisher']} · {item['published']}"
+            )
+            st.markdown(
+                f"[Read original article]({item['link']})"
+            )
 
     # -------------------------
     # Forecast
