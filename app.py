@@ -69,19 +69,17 @@ def load_data(symbol, period):
     if df.empty:
         return df
 
-    df = df[
+    return df[
         ["Open", "High", "Low", "Close", "Volume"]
     ].dropna()
-
-    return df
 
 
 # -------------------------
 # Yahoo Finance news search
 # -------------------------
-@st.cache_data(ttl=900)
+@st.cache_data(ttl=60)
 def load_news(symbol):
-    """Retrieve available Yahoo Finance search headlines."""
+    """Retrieve Yahoo Finance search news and expose errors."""
 
     try:
         search = yf.Search(
@@ -93,57 +91,55 @@ def load_news(symbol):
         search_results = search.search()
         articles = search_results.get("news", []) or []
 
-    except Exception:
-        return [], "News search failed."
+        results = []
 
-    results = []
+        for article in articles:
+            title = article.get("title", "")
+            link = article.get("link", "")
 
-    for article in articles:
-        title = article.get("title", "")
-        link = article.get("link", "")
-        publisher = article.get(
-            "publisher",
-            "Unknown source"
-        )
+            if not title or not link:
+                continue
 
-        if not title or not link:
-            continue
+            if not link.startswith("https://"):
+                continue
 
-        if not link.startswith("https://"):
-            continue
+            published = article.get("providerPublishTime")
 
-        published = article.get("providerPublishTime")
+            if isinstance(published, (int, float)):
+                try:
+                    published = datetime.fromtimestamp(
+                        published,
+                        tz=timezone.utc
+                    ).strftime("%Y-%m-%d %H:%M UTC")
+                except (ValueError, OSError, OverflowError):
+                    published = "Date unavailable"
+            else:
+                published = article.get(
+                    "pubDate",
+                    "Date unavailable"
+                )
 
-        if isinstance(published, (int, float)):
-            try:
-                published = datetime.fromtimestamp(
-                    published,
-                    tz=timezone.utc
-                ).strftime("%Y-%m-%d %H:%M UTC")
-            except (ValueError, OSError, OverflowError):
-                published = "Date unavailable"
+            results.append({
+                "title": title,
+                "publisher": article.get(
+                    "publisher",
+                    "Unknown source"
+                ),
+                "link": link,
+                "published": published
+            })
 
-        else:
-            published = article.get(
-                "pubDate",
-                "Date unavailable"
-            )
+        return results, None
 
-        results.append({
-            "title": title,
-            "publisher": publisher,
-            "link": link,
-            "published": published
-        })
-
-    return results, None
+    except Exception as e:
+        return [], f"{type(e).__name__}: {e}"
 
 
 # -------------------------
 # Feature engineering
 # -------------------------
 def make_features(df):
-    """Create features from historical observations."""
+    """Build features from historical market observations."""
 
     close = df["Close"]
     returns = close.pct_change()
@@ -163,18 +159,13 @@ def make_features(df):
     features["volatility_5"] = returns.rolling(5).std()
     features["volatility_20"] = returns.rolling(20).std()
 
-    # Volume changes
-    features["volume_change"] = (
-        df["Volume"].pct_change()
-    )
-    features["volume_change_5"] = (
-        df["Volume"].pct_change(5)
-    )
+    # Trading volume changes
+    features["volume_change"] = df["Volume"].pct_change()
+    features["volume_change_5"] = df["Volume"].pct_change(5)
 
-    # Predict the next trading day's return
+    # Next trading day's return
     target = returns.shift(-1)
 
-    # Remove invalid feature values
     features = features.replace(
         [np.inf, -np.inf],
         np.nan
@@ -184,13 +175,12 @@ def make_features(df):
 
 
 # -------------------------
-# Model training and forecasting
+# Train model and forecast
 # -------------------------
 def train_and_forecast(df, horizon):
 
     features, target = make_features(df)
 
-    # Only use observations with known target values
     dataset = features.copy()
     dataset["target"] = target
     dataset = dataset.dropna()
@@ -218,7 +208,7 @@ def train_and_forecast(df, horizon):
             "Not enough observations for model evaluation."
         )
 
-    # Evaluate on historical observations not used for fitting
+    # Evaluate on the held-out period
     test_model = RandomForestRegressor(
         n_estimators=200,
         max_depth=5,
@@ -241,7 +231,7 @@ def train_and_forecast(df, horizon):
         == np.sign(y_test.to_numpy())
     )
 
-    # Train final model using all available labeled data
+    # Train final model on all labeled observations
     model = RandomForestRegressor(
         n_estimators=200,
         max_depth=5,
@@ -252,7 +242,7 @@ def train_and_forecast(df, horizon):
 
     model.fit(X, y)
 
-    # Start from the latest historical observations
+    # Forecast recursively
     history = df.copy()
 
     future_dates = []
@@ -263,7 +253,6 @@ def train_and_forecast(df, horizon):
     for _ in range(horizon):
 
         current_features, _ = make_features(history)
-
         latest_features = current_features.iloc[[-1]]
 
         if latest_features.isna().any(axis=None):
@@ -275,26 +264,24 @@ def train_and_forecast(df, horizon):
             model.predict(latest_features)[0]
         )
 
-        # Limit extreme predicted daily returns.
-        # This is a modeling constraint, not a guarantee.
+        # Cap extreme extrapolated daily returns
         predicted_return = float(
             np.clip(predicted_return, -0.15, 0.15)
         )
 
         last_price *= 1 + predicted_return
-
         predicted_prices.append(last_price)
 
         # Approximate the next business day.
-        # This does not account for exchange holidays.
+        # Exchange holidays are not accounted for.
         next_date = (
             history.index[-1] + pd.offsets.BDay(1)
         )
 
         future_dates.append(next_date)
 
-        # Placeholder future observation.
-        # Future prices and volume are unknown.
+        # Placeholder for unknown future observations.
+        # Future volume is assumed to remain unchanged.
         next_row = pd.DataFrame(
             {
                 "Open": [last_price],
@@ -333,7 +320,7 @@ if not ticker:
 
 try:
 
-    # Load historical stock data
+    # Load stock history
     with st.spinner(f"Loading {ticker}..."):
         data = load_data(
             ticker,
@@ -343,7 +330,7 @@ try:
     if data.empty:
         st.error(
             "No historical data found. "
-            "Check the ticker symbol and try again."
+            "Check the ticker symbol."
         )
         st.stop()
 
@@ -360,10 +347,7 @@ try:
     )
 
     if len(data) > 1:
-
-        previous_close = float(
-            data["Close"].iloc[-2]
-        )
+        previous_close = float(data["Close"].iloc[-2])
 
         change = latest_price - previous_close
 
@@ -396,24 +380,25 @@ try:
 
     if news_error:
 
+        # Temporary diagnostic message:
+        # Shows the actual exception instead of hiding it.
         st.warning(
-            "News could not be retrieved. "
-            "The historical price analysis can still be used."
+            f"News retrieval error: {news_error}"
         )
 
     elif not news_items:
 
         st.info(
-            "No usable headlines were returned. "
-            "News availability depends on the data provider."
+            "The search completed, but no usable headlines "
+            "were returned."
         )
 
     else:
 
         st.caption(
             f"{len(news_items)} available headlines. "
-            "Search results may include unrelated companies "
-            "or broader market news."
+            "Some results may concern related companies "
+            "or broader markets."
         )
 
         for item in news_items:
@@ -434,7 +419,7 @@ try:
                 )
 
     # -------------------------
-    # Train model and forecast
+    # Forecast
     # -------------------------
     with st.spinner(
         "Training and evaluating the model..."
@@ -451,9 +436,11 @@ try:
         )
 
     # -------------------------
-    # Historical and forecast chart
+    # Stock chart
     # -------------------------
-    st.subheader("Historical prices and experimental forecast")
+    st.subheader(
+        "Historical prices and experimental forecast"
+    )
 
     fig = go.Figure()
 
@@ -463,20 +450,14 @@ try:
             y=data["Close"],
             mode="lines",
             name="Historical adjusted close",
-            line=dict(
-                color="#2563eb",
-                width=2
-            )
+            line=dict(color="#2563eb", width=2)
         )
     )
 
-    # Connect the last historical price to the forecast
+    # Connect historical price to the first forecast point
     fig.add_trace(
         go.Scatter(
-            x=[
-                data.index[-1],
-                forecast.index[0]
-            ],
+            x=[data.index[-1], forecast.index[0]],
             y=[
                 data["Close"].iloc[-1],
                 forecast.iloc[0]
@@ -510,14 +491,7 @@ try:
         hovermode="x unified",
         height=600,
         xaxis_title="Date",
-        yaxis_title="Adjusted price (USD)",
-        legend=dict(
-            orientation="h",
-            yanchor="bottom",
-            y=1.02,
-            xanchor="left",
-            x=0
-        )
+        yaxis_title="Adjusted price (USD)"
     )
 
     st.plotly_chart(
@@ -528,9 +502,7 @@ try:
     # -------------------------
     # Forecast summary
     # -------------------------
-    predicted_price = float(
-        forecast.iloc[-1]
-    )
+    predicted_price = float(forecast.iloc[-1])
 
     predicted_change = (
         predicted_price / latest_price - 1
@@ -561,16 +533,16 @@ try:
     )
 
     # -------------------------
-    # Limitations and transparency
+    # Limitations
     # -------------------------
     st.warning(
-        "Experimental research forecast only. This model "
-        "uses historical market features and does not yet "
-        "incorporate news sentiment, political events, "
-        "company announcements, or future market conditions. "
-        "Recursive forecasts can compound errors, and the "
-        "projected line is not a confidence interval. "
-        "Past performance does not guarantee future results."
+        "Experimental research forecast only. The model uses "
+        "historical market features and does not yet use news "
+        "sentiment, political events, company announcements, "
+        "or future market conditions. Recursive forecasts can "
+        "compound errors. The projected line is not a "
+        "confidence interval. Past performance does not "
+        "guarantee future results."
     )
 
     # -------------------------
@@ -578,10 +550,8 @@ try:
     # -------------------------
     with st.expander("View forecast values"):
 
-        forecast_table = forecast.to_frame()
-
         st.dataframe(
-            forecast_table,
+            forecast.to_frame(),
             use_container_width=True
         )
 
@@ -599,7 +569,7 @@ except Exception as e:
 
     st.error(
         "The analysis could not be completed. "
-        "Check the ticker, data availability, or application logs."
+        "Check the ticker, data availability, or logs."
     )
 
     st.exception(e)
