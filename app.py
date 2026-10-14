@@ -6,6 +6,7 @@ import plotly.graph_objects as go
 
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
+from datetime import datetime, timezone
 
 st.set_page_config(
     page_title="MarketScope AI",
@@ -65,6 +66,54 @@ def load_data(symbol, period):
     df = df.dropna()
     return df
 
+@st.cache_data(ttl=900)
+def load_news(symbol):
+    """Retrieve recent news for a ticker, if available."""
+    try:
+        articles = yf.Ticker(symbol).news or []
+    except Exception:
+        return []
+
+    results = []
+
+    for article in articles:
+        # Yahoo Finance may wrap article information in "content".
+        item = article.get("content", article)
+
+        title = item.get("title", "")
+        if not title:
+            continue
+
+        link = item.get("canonicalUrl", {})
+        if isinstance(link, dict):
+            link = link.get("url", "")
+
+        # Support older yfinance article formats too.
+        if not link:
+            link = article.get("link", "")
+
+        publisher = item.get("provider", {})
+        if isinstance(publisher, dict):
+            publisher = publisher.get("displayName", "Unknown source")
+        else:
+            publisher = "Unknown source"
+
+        pub_date = item.get("pubDate")
+        if not pub_date:
+            timestamp = article.get("providerPublishTime")
+            if timestamp:
+                pub_date = datetime.fromtimestamp(
+                    timestamp, tz=timezone.utc
+                ).isoformat()
+
+        results.append({
+            "title": title,
+            "publisher": publisher,
+            "link": link,
+            "published": pub_date or "Date unavailable"
+        })
+
+    return results
 
 def make_features(df):
     """Create features using only information available by each day."""
@@ -241,7 +290,38 @@ try:
         "Historical observations",
         f"{len(data):,}"
     )
+    
+    # -------------------------
+    # Recent company news
+    # -------------------------
+    st.subheader(f"📰 Recent news about {ticker}")
 
+    with st.spinner("Fetching recent headlines..."):
+        news_items = load_news(ticker)
+
+    if not news_items:
+        st.info(
+            "No recent headlines were returned for this ticker. "
+            "News availability depends on the data provider."
+        )
+    else:
+        st.caption(
+            f"Showing up to {len(news_items)} available headlines. "
+            "Publication times and coverage may vary."
+        )
+
+        for item in news_items:
+            with st.container(border=True):
+                st.markdown(f"**{item['title']}**")
+                st.caption(
+                    f"{item['publisher']} · {item['published']}"
+                )
+
+                if item["link"]:
+                    st.markdown(
+                        f"[Read original article]({item['link']})"
+                    )
+    
     st.subheader(f"{ticker}: historical prices and forecast")
 
     with st.spinner("Training and evaluating the model..."):
