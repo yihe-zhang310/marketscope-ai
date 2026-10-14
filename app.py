@@ -74,12 +74,10 @@ def load_data(symbol, period):
     ].dropna()
 
 
-# -------------------------
-# Yahoo Finance news search
-# -------------------------
+
 @st.cache_data(ttl=60)
 def load_news(symbol):
-    """Retrieve Yahoo Finance search news and expose errors."""
+    """Retrieve news headlines from Yahoo Finance."""
 
     try:
         search = yf.Search(
@@ -89,13 +87,23 @@ def load_news(symbol):
         )
 
         search_results = search.search()
-        articles = search_results.get("news", []) or []
+
+        # Handle either a dictionary or an object response.
+        if isinstance(search_results, dict):
+            articles = search_results.get("news", []) or []
+        else:
+            articles = getattr(
+                search_results, "news", []
+            ) or []
 
         results = []
 
         for article in articles:
             title = article.get("title", "")
             link = article.get("link", "")
+            publisher = article.get(
+                "publisher", "Unknown source"
+            )
 
             if not title or not link:
                 continue
@@ -115,16 +123,12 @@ def load_news(symbol):
                     published = "Date unavailable"
             else:
                 published = article.get(
-                    "pubDate",
-                    "Date unavailable"
+                    "pubDate", "Date unavailable"
                 )
 
             results.append({
                 "title": title,
-                "publisher": article.get(
-                    "publisher",
-                    "Unknown source"
-                ),
+                "publisher": publisher,
                 "link": link,
                 "published": published
             })
@@ -133,6 +137,7 @@ def load_news(symbol):
 
     except Exception as e:
         return [], f"{type(e).__name__}: {e}"
+
 
 
 # -------------------------
