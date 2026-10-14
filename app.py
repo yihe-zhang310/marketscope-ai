@@ -1,10 +1,14 @@
+
 import streamlit as st
 import yfinance as yf
 import pandas as pd
 import numpy as np
 import plotly.graph_objects as go
+import requests
+import xml.etree.ElementTree as ET
 
 from datetime import datetime, timezone
+from urllib.parse import urlencode
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.metrics import mean_absolute_error
 
@@ -20,6 +24,7 @@ st.set_page_config(
 )
 
 st.title("📈 MarketScope AI")
+
 st.caption(
     "An educational stock analysis and machine-learning forecasting tool. "
     "Predictions are experimental and are not financial advice."
@@ -32,6 +37,8 @@ st.caption(
 
 @st.cache_data(ttl=900)
 def load_data(symbol, period):
+    """Download historical adjusted stock prices."""
+
     ticker = yf.Ticker(symbol)
 
     data = ticker.history(
@@ -66,22 +73,22 @@ def load_data(symbol, period):
 
     if len(data) < 60:
         raise ValueError(
-            "Not enough historical observations. "
-            "Try a longer historical period."
+            "Not enough historical data to train the model. "
+            "Select a longer historical period."
         )
 
     return data
 
 
 # ============================================================
-# COMPANY NEWS
+# COMPANY NEWS — GOOGLE NEWS RSS
 # ============================================================
 
 @st.cache_data(ttl=300)
 def load_news(symbol):
     """
-    Retrieve news using the yfinance Search object's .news property.
-    Returns articles, error message, query, and diagnostic information.
+    Retrieve news from Google News RSS rather than Yahoo Finance's
+    news endpoint. Returns articles, error, query, and diagnostics.
     """
 
     symbol = symbol.strip().upper()
@@ -120,89 +127,76 @@ def load_news(symbol):
     }
 
     company = company_names.get(symbol, "")
-    query = f"{symbol} {company}".strip()
+
+    if company:
+        query = f'"{company}" stock OR {symbol}'
+    else:
+        query = f'"{symbol}" stock'
+
+    params = {
+        "q": query,
+        "hl": "en-US",
+        "gl": "US",
+        "ceid": "US:en",
+    }
+
+    feed_url = (
+        "https://news.google.com/rss/search?"
+        + urlencode(params)
+    )
 
     diagnostics = {
         "query": query,
-        "response_type": "Not received",
-        "article_count": 0,
-        "first_article_keys": [],
-        "first_article_sample": None,
+        "source": "Google News RSS",
+        "http_status": None,
+        "articles_received": 0,
     }
 
     try:
-        search = yf.Search(
-            query,
-            news_count=20,
-            max_results=10
+        response = requests.get(
+            feed_url,
+            headers={
+                "User-Agent": "Mozilla/5.0 MarketScopeAI/1.0"
+            },
+            timeout=15,
         )
 
-        # IMPORTANT:
-        # Read the news property directly instead of treating
-        # the Search object as a dictionary.
-        articles = search.news
+        diagnostics["http_status"] = response.status_code
 
-        diagnostics["response_type"] = type(articles).__name__
+        response.raise_for_status()
 
-        if not isinstance(articles, list):
-            articles = []
+        root = ET.fromstring(response.content)
+        items = root.findall("./channel/item")
 
-        diagnostics["article_count"] = len(articles)
-
-        if articles and isinstance(articles[0], dict):
-            diagnostics["first_article_keys"] = list(
-                articles[0].keys()
-            )
-
-            diagnostics["first_article_sample"] = {
-                key: value
-                for key, value in list(articles[0].items())[:8]
-            }
+        diagnostics["articles_received"] = len(items)
 
         results = []
         seen_links = set()
 
-        for original in articles:
-            if not isinstance(original, dict):
-                continue
-
-            article = dict(original)
-
-            # Some response formats nest the article fields.
-            content = article.get("content")
-
-            if isinstance(content, dict):
-                article = {**article, **content}
-
-            title = str(
-                article.get("title")
-                or article.get("headline")
-                or ""
+        for item in items:
+            title = (
+                item.findtext("title") or ""
             ).strip()
 
-            # Extract a URL from common response formats.
-            link = article.get("link") or ""
+            link = (
+                item.findtext("link") or ""
+            ).strip()
 
-            if isinstance(link, dict):
-                link = link.get("url", "")
+            published = (
+                item.findtext("pubDate") or "Date unavailable"
+            ).strip()
 
-            if not link:
-                canonical = article.get("canonicalUrl")
+            source_element = item.find("source")
 
-                if isinstance(canonical, dict):
-                    link = canonical.get("url", "")
-                elif isinstance(canonical, str):
-                    link = canonical
+            if (
+                source_element is not None
+                and source_element.text
+            ):
+                publisher = source_element.text.strip()
+            else:
+                publisher = "Google News"
 
-            if not link:
-                click_url = article.get("clickThroughUrl")
-
-                if isinstance(click_url, dict):
-                    link = click_url.get("url", "")
-                elif isinstance(click_url, str):
-                    link = click_url
-
-            if not title or not isinstance(link, str):
+            if not title or not link:
                 continue
 
             if not link.startswith(("https://", "http://")):
@@ -213,65 +207,45 @@ def load_news(symbol):
 
             seen_links.add(link)
 
-            # Published date.
-            published = (
-                article.get("providerPublishTime")
-                or article.get("pubDate")
-                or article.get("displayTime")
-                or article.get("published")
-                or "Date unavailable"
-            )
-
-            if isinstance(published, (int, float)):
-                try:
-                    published = datetime.fromtimestamp(
-                        published,
-                        tz=timezone.utc
-                    ).strftime("%Y-%m-%d %H:%M UTC")
-                except (ValueError, OSError, OverflowError):
-                    published = "Date unavailable"
-
-            # Publisher.
-            provider = article.get("provider")
-
-            if isinstance(provider, dict):
-                publisher = (
-                    provider.get("displayName")
-                    or provider.get("name")
-                    or "News source"
-                )
-            else:
-                publisher = (
-                    article.get("publisher")
-                    or provider
-                    or article.get("source")
-                    or "News source"
-                )
-
             results.append({
                 "title": title,
-                "publisher": str(publisher),
+                "publisher": publisher,
                 "link": link,
-                "published": str(published),
+                "published": published,
             })
 
         error = None
 
         if not results:
             error = (
-                "The search returned no usable article links. "
-                "Yahoo Finance may have returned no articles, "
-                "or the response format may differ from expected."
+                "Google News returned no usable articles for this query. "
+                "Try another ticker or refresh later."
             )
 
         return results, error, query, diagnostics
 
+    except requests.RequestException as exc:
+        return (
+            [],
+            f"News request failed: {type(exc).__name__}: {exc}",
+            query,
+            diagnostics,
+        )
+
+    except ET.ParseError as exc:
+        return (
+            [],
+            f"Could not parse the Google News feed: {exc}",
+            query,
+            diagnostics,
+        )
+
     except Exception as exc:
         return (
             [],
-            f"{type(exc).__name__}: {exc}",
+            f"Unexpected news error: {type(exc).__name__}: {exc}",
             query,
-            diagnostics
+            diagnostics,
         )
 
 
@@ -281,7 +255,7 @@ def load_news(symbol):
 
 def make_features(data):
     """
-    Construct lagged features from historical data.
+    Build historical features.
     The target is the next observed trading day's return.
     """
 
@@ -292,7 +266,7 @@ def make_features(data):
 
     returns = close.pct_change(fill_method=None)
 
-    # Lagged daily returns.
+    # Lagged returns
     frame["return_1"] = returns.shift(1)
     frame["return_2"] = returns.shift(2)
     frame["return_3"] = returns.shift(3)
@@ -300,7 +274,7 @@ def make_features(data):
     frame["return_10"] = returns.shift(10)
     frame["return_20"] = returns.shift(20)
 
-    # Historical momentum.
+    # Momentum
     frame["momentum_5"] = (
         close.pct_change(5, fill_method=None).shift(1)
     )
@@ -311,7 +285,7 @@ def make_features(data):
         close.pct_change(20, fill_method=None).shift(1)
     )
 
-    # Historical volatility.
+    # Volatility
     frame["volatility_5"] = (
         returns.rolling(5).std().shift(1)
     )
@@ -319,7 +293,7 @@ def make_features(data):
         returns.rolling(20).std().shift(1)
     )
 
-    # Volume-derived features.
+    # Volume changes
     frame["volume_change"] = (
         volume.pct_change(fill_method=None).shift(1)
     )
@@ -327,7 +301,7 @@ def make_features(data):
         volume.pct_change(5, fill_method=None).shift(1)
     )
 
-    # Predict the next observed daily return.
+    # Next observed day's return
     frame["target"] = returns.shift(-1)
 
     frame = frame.replace([np.inf, -np.inf], np.nan)
@@ -366,18 +340,18 @@ def train_and_forecast(data, horizon):
     if len(training_data) < 40:
         raise ValueError(
             "Not enough complete observations to train the model. "
-            "Select a longer historical period."
+            "Choose a longer historical period."
         )
 
     X = training_data[feature_columns]
     y = training_data["target"]
 
-    # Chronological split. Do not shuffle time-series data.
+    # Chronological split to respect time-series order
     split_index = int(len(training_data) * 0.8)
 
     if split_index < 20 or len(training_data) - split_index < 5:
         raise ValueError(
-            "Not enough observations for the training and testing split."
+            "Not enough observations for the training/testing split."
         )
 
     X_train = X.iloc[:split_index]
@@ -404,10 +378,11 @@ def train_and_forecast(data, horizon):
     )
 
     directional_accuracy = np.mean(
-        np.sign(test_predictions) == np.sign(y_test.to_numpy())
+        np.sign(test_predictions)
+        == np.sign(y_test.to_numpy())
     )
 
-    # Retrain using all labeled observations.
+    # Retrain on all available labeled data for forecasting
     model = RandomForestRegressor(
         n_estimators=200,
         max_depth=5,
@@ -418,7 +393,6 @@ def train_and_forecast(data, horizon):
 
     model.fit(X, y)
 
-    # Begin recursive forecasting from the available historical data.
     history = data[
         ["Open", "High", "Low", "Close", "Volume"]
     ].copy()
@@ -438,7 +412,7 @@ def train_and_forecast(data, horizon):
 
         if latest_features.isna().to_numpy().any():
             raise ValueError(
-                "The latest row contains missing features. "
+                "The latest observation has missing model features. "
                 "Try a longer historical period."
             )
 
@@ -451,19 +425,23 @@ def train_and_forecast(data, horizon):
                 "The model generated an invalid return prediction."
             )
 
-        # Prevent extreme numerical predictions from cascading.
+        # Limit extreme values in recursive predictions
         predicted_return = float(
             np.clip(predicted_return, -0.5, 0.5)
         )
 
         predicted_price = current_price * (1 + predicted_return)
 
-        if not np.isfinite(predicted_price) or predicted_price <= 0:
+        if (
+            not np.isfinite(predicted_price)
+            or predicted_price <= 0
+        ):
             raise ValueError(
                 "The model generated an invalid predicted price."
             )
 
-        # Business-day approximation; exchange holidays are not excluded.
+        # Approximate future trading dates with business days.
+        # Exchange-specific holidays are not excluded.
         future_date = last_date + pd.offsets.BDay(1)
 
         forecasts.append({
@@ -472,7 +450,7 @@ def train_and_forecast(data, horizon):
             "Predicted Return": predicted_return,
         })
 
-        # Volume is carried forward as a placeholder for future dates.
+        # Placeholder for future volume: carry forward the last value.
         last_volume = float(history["Volume"].iloc[-1])
 
         new_row = pd.DataFrame(
@@ -502,7 +480,7 @@ def train_and_forecast(data, horizon):
 
 
 # ============================================================
-# SIDEBAR
+# SIDEBAR CONTROLS
 # ============================================================
 
 st.sidebar.header("⚙️ Analysis settings")
@@ -547,7 +525,7 @@ if st.sidebar.button("Refresh data", type="primary"):
 
 
 # ============================================================
-# MAIN APP
+# MAIN APPLICATION
 # ============================================================
 
 if not ticker:
@@ -604,12 +582,12 @@ try:
     )
 
     st.caption(
-        "Historical prices are adjusted for relevant corporate actions. "
+        "Prices are adjusted historical data from Yahoo Finance. "
         "The latest observation may not be today's live market price."
     )
 
     # --------------------------------------------------------
-    # HISTORICAL CHART
+    # HISTORICAL PRICE CHART
     # --------------------------------------------------------
 
     st.subheader("📈 Historical price")
@@ -645,16 +623,17 @@ try:
         )
 
     # --------------------------------------------------------
-    # NEWS SECTION
+    # NEWS
     # --------------------------------------------------------
 
     st.divider()
     st.subheader(f"📰 Recent company news: {ticker}")
 
-    with st.spinner("Retrieving recent news..."):
+    with st.spinner("Retrieving news from Google News..."):
         news, news_error, news_query, diagnostics = load_news(ticker)
 
-    st.caption(f"Search query: {news_query}")
+    st.caption(f"News search query: {news_query}")
+    st.caption("News source: Google News RSS")
 
     if news:
 
@@ -693,35 +672,28 @@ try:
                 )
 
                 st.write(
-                    "**Response type:**",
-                    diagnostics.get("response_type", "Unknown")
+                    "**News source:**",
+                    diagnostics.get("source", "")
+                )
+
+                st.write(
+                    "**HTTP status:**",
+                    diagnostics.get("http_status")
                 )
 
                 st.write(
                     "**Articles received:**",
-                    diagnostics.get("article_count", 0)
+                    diagnostics.get("articles_received", 0)
                 )
-
-                st.write(
-                    "**First article keys:**",
-                    diagnostics.get("first_article_keys", [])
-                )
-
-                sample = diagnostics.get("first_article_sample")
-
-                if sample is not None:
-                    st.write("**First article sample:**")
-                    st.json(sample)
 
                 st.caption(
-                    "If no articles were received, Yahoo Finance may "
-                    "have returned an empty result or restricted access. "
-                    "If articles were received but none appeared, the "
-                    "sample can help identify the correct field names."
+                    "HTTP 200 means the server responded successfully, "
+                    "but it does not guarantee that the feed contains "
+                    "matching articles."
                 )
 
     # --------------------------------------------------------
-    # FORECAST
+    # MODEL AND EVALUATION
     # --------------------------------------------------------
 
     st.divider()
@@ -754,10 +726,10 @@ try:
     )
 
     st.caption(
-        "MAE measures average absolute prediction error in daily returns. "
-        "Directional accuracy measures how often predicted and actual "
-        "returns have the same sign on the held-out test set. "
-        "These historical metrics do not guarantee future accuracy."
+        "MAE is measured in daily returns, not dollars. "
+        "Directional accuracy measures how often the predicted and "
+        "actual returns have the same sign on held-out data. "
+        "These historical metrics do not guarantee future performance."
     )
 
     # --------------------------------------------------------
@@ -848,12 +820,12 @@ try:
     st.warning(
         "**Model limitations:** This is an experimental educational "
         "forecast, not a reliable prediction of future market prices. "
-        "The model uses historical price and volume-derived features. "
-        "It does not include company fundamentals, news sentiment, "
-        "economic conditions, or other external factors. Multi-day "
-        "forecasts are recursive, so errors can accumulate. Future "
-        "volume is carried forward as a placeholder, and forecast dates "
-        "use business days rather than an exchange-specific calendar."
+        "It uses historical price and volume-derived features and does "
+        "not include company fundamentals, news sentiment, economic "
+        "conditions, or other external factors. Multi-day forecasts are "
+        "recursive, so errors can accumulate. Future volume is carried "
+        "forward as a placeholder, and forecast dates use business days "
+        "rather than an exchange-specific calendar."
     )
 
 except Exception as exc:
