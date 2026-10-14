@@ -74,44 +74,41 @@ def load_data(symbol, period):
     ].dropna()
 
 
-
-
+# -------------------------
+# Company news retrieval
+# -------------------------
 @st.cache_data(ttl=300)
 def load_news(symbol):
-    """Retrieve and filter news for the selected company."""
+    """Retrieve recent news and filter obvious irrelevant headlines."""
 
-    # Common company names for frequently searched tickers.
     company_names = {
-        "NVDA": "NVIDIA",
-        "AAPL": "Apple",
-        "MSFT": "Microsoft",
-        "GOOGL": "Alphabet Google",
-        "GOOG": "Alphabet Google",
-        "AMZN": "Amazon",
-        "META": "Meta",
-        "TSLA": "Tesla",
-        "AMD": "AMD",
-        "INTC": "Intel",
-        "NFLX": "Netflix",
-        "AVGO": "Broadcom",
-        "ORCL": "Oracle",
-        "CRM": "Salesforce",
-        "JPM": "JPMorgan",
-        "WMT": "Walmart",
-        "DIS": "Disney",
-        "COST": "Costco",
-        "PLTR": "Palantir",
-        "SMCI": "Super Micro Computer",
+        "NVDA": ["NVIDIA"],
+        "AAPL": ["Apple"],
+        "MSFT": ["Microsoft"],
+        "GOOGL": ["Alphabet", "Google"],
+        "GOOG": ["Alphabet", "Google"],
+        "AMZN": ["Amazon"],
+        "META": ["Meta", "Facebook"],
+        "TSLA": ["Tesla"],
+        "AMD": ["AMD"],
+        "INTC": ["Intel"],
+        "NFLX": ["Netflix"],
+        "AVGO": ["Broadcom"],
+        "ORCL": ["Oracle"],
+        "CRM": ["Salesforce"],
+        "JPM": ["JPMorgan", "JPMorgan Chase"],
+        "WMT": ["Walmart"],
+        "DIS": ["Disney"],
+        "COST": ["Costco"],
+        "PLTR": ["Palantir"],
+        "SMCI": ["Super Micro Computer"],
     }
 
-    company_name = company_names.get(symbol, "")
+    names = company_names.get(symbol, [])
+    query = f"{symbol} stock news"
 
-    # Search using the ticker and, when known, company name.
-    query = (
-        f"{symbol} {company_name} stock news"
-        if company_name
-        else f"{symbol} stock news"
-    )
+    if names:
+        query = f"{symbol} {names[0]} stock news"
 
     try:
         search = yf.Search(
@@ -122,7 +119,6 @@ def load_news(symbol):
 
         search_results = search.search()
 
-        # Accommodate different yfinance response types.
         if isinstance(search_results, dict):
             articles = search_results.get("news", []) or []
         else:
@@ -135,46 +131,38 @@ def load_news(symbol):
         rejected_count = 0
 
         for article in articles:
-            title = article.get("title", "")
-            link = article.get("link", "")
+            if not isinstance(article, dict):
+                continue
 
-            if not title or not link:
+            title = str(article.get("title") or "").strip()
+            link = str(article.get("link") or "").strip()
+
+            if not title or not link.startswith("https://"):
                 rejected_count += 1
                 continue
 
-            if not link.startswith("https://"):
-                rejected_count += 1
-                continue
-
-            # Filter obvious duplicates.
             if link in seen_links:
                 continue
 
             seen_links.add(link)
 
-            # Check whether the headline mentions the ticker
-            # or the known company name.
-            headline = title.casefold()
-            ticker_mentioned = (
-                symbol.casefold() in headline.split()
-            )
+            # Filter headlines for known companies.
+            # This is a simple heuristic, not a guarantee of relevance.
+            if names:
+                headline = title.casefold()
 
-            company_mentioned = (
-                bool(company_name)
-                and any(
-                    name.casefold() in headline
-                    for name in company_name.split()
-                    if len(name) > 2
+                ticker_mentioned = (
+                    symbol.casefold() in headline.split()
                 )
-            )
 
-            # Unknown tickers are not aggressively filtered:
-            # without a company-name mapping, relevance is uncertain.
-            if company_name and not (
-                ticker_mentioned or company_mentioned
-            ):
-                rejected_count += 1
-                continue
+                company_mentioned = any(
+                    name.casefold() in headline
+                    for name in names
+                )
+
+                if not (ticker_mentioned or company_mentioned):
+                    rejected_count += 1
+                    continue
 
             published = article.get("providerPublishTime")
 
@@ -187,9 +175,9 @@ def load_news(symbol):
                 except (ValueError, OSError, OverflowError):
                     published = "Date unavailable"
             else:
-                published = article.get(
-                    "pubDate",
-                    "Date unavailable"
+                published = (
+                    article.get("pubDate")
+                    or "Date unavailable"
                 )
 
             results.append({
@@ -212,12 +200,11 @@ def load_news(symbol):
         )
 
 
-
 # -------------------------
 # Feature engineering
 # -------------------------
 def make_features(df):
-    """Build features from historical market observations."""
+    """Create historical features and next-day return targets."""
 
     close = df["Close"]
     returns = close.pct_change()
@@ -241,7 +228,7 @@ def make_features(df):
     features["volume_change"] = df["Volume"].pct_change()
     features["volume_change_5"] = df["Volume"].pct_change(5)
 
-    # Next trading day's return
+    # Target: next trading day's return
     target = returns.shift(-1)
 
     features = features.replace(
@@ -261,7 +248,10 @@ def train_and_forecast(df, horizon):
 
     dataset = features.copy()
     dataset["target"] = target
-    dataset = dataset.dropna()
+    dataset = dataset.replace(
+        [np.inf, -np.inf],
+        np.nan
+    ).dropna()
 
     if len(dataset) < 150:
         raise ValueError(
@@ -296,7 +286,6 @@ def train_and_forecast(df, horizon):
     )
 
     test_model.fit(X_train, y_train)
-
     test_predictions = test_model.predict(X_test)
 
     mae = mean_absolute_error(
@@ -320,9 +309,8 @@ def train_and_forecast(df, horizon):
 
     model.fit(X, y)
 
-    # Forecast recursively
+    # Recursive forecast
     history = df.copy()
-
     future_dates = []
     predicted_prices = []
 
@@ -338,11 +326,16 @@ def train_and_forecast(df, horizon):
                 "Unable to construct forecast features."
             )
 
+        # Ensure feature columns match model training columns.
+        latest_features = latest_features.reindex(
+            columns=X.columns
+        )
+
         predicted_return = float(
             model.predict(latest_features)[0]
         )
 
-        # Cap extreme extrapolated daily returns
+        # Limit extreme extrapolated daily returns.
         predicted_return = float(
             np.clip(predicted_return, -0.15, 0.15)
         )
@@ -350,7 +343,7 @@ def train_and_forecast(df, horizon):
         last_price *= 1 + predicted_return
         predicted_prices.append(last_price)
 
-        # Approximate the next business day.
+        # Approximate next business day.
         # Exchange holidays are not accounted for.
         next_date = (
             history.index[-1] + pd.offsets.BDay(1)
@@ -358,8 +351,7 @@ def train_and_forecast(df, horizon):
 
         future_dates.append(next_date)
 
-        # Placeholder for unknown future observations.
-        # Future volume is assumed to remain unchanged.
+        # Future volume is unknown, so carry the latest value forward.
         next_row = pd.DataFrame(
             {
                 "Open": [last_price],
@@ -412,6 +404,13 @@ try:
         )
         st.stop()
 
+    if len(data) < 150:
+        st.error(
+            "Not enough historical data for this model. "
+            "Try a longer historical period."
+        )
+        st.stop()
+
     latest_price = float(data["Close"].iloc[-1])
 
     # -------------------------
@@ -448,50 +447,50 @@ try:
         f"{len(data):,}"
     )
 
-   
-# -------------------------
-# Recent company news
-# -------------------------
-st.subheader(f"📰 Recent news: {ticker}")
+    # -------------------------
+    # Recent company news
+    # -------------------------
+    st.subheader(f"📰 Recent news: {ticker}")
 
-with st.spinner("Searching for relevant headlines..."):
-    news_items, news_error, rejected_count, news_query = (
-        load_news(ticker)
-    )
+    with st.spinner("Searching for relevant headlines..."):
+        news_items, news_error, rejected_count, news_query = (
+            load_news(ticker)
+        )
 
-if news_error:
-    st.warning(f"News retrieval error: {news_error}")
+    if news_error:
+        st.warning(f"News retrieval error: {news_error}")
+        st.caption(f"Search query: {news_query}")
 
-elif not news_items:
-    st.info(
-        "No headlines passed the relevance filter. "
-        "Try another ticker or check again later."
-    )
-    st.caption(f"Search query: {news_query}")
+    elif not news_items:
+        st.info(
+            "No headlines passed the relevance filter, "
+            "or the news provider returned no articles."
+        )
+        st.caption(f"Search query: {news_query}")
 
-else:
-    st.caption(
-        f"Showing {len(news_items)} potentially relevant "
-        f"headlines. Filtered out {rejected_count} "
-        "unrelated or unusable results."
-    )
+    else:
+        st.caption(
+            f"Showing {len(news_items)} potentially relevant "
+            f"headlines. Filtered out {rejected_count} "
+            "unrelated or unusable results."
+        )
 
-    for item in news_items:
-        with st.container(border=True):
-            st.markdown(f"**{item['title']}**")
-            st.caption(
-                f"{item['publisher']} · {item['published']}"
-            )
-            st.markdown(
-                f"[Read original article]({item['link']})"
-            )
+        for item in news_items:
+            with st.container(border=True):
+                st.markdown(f"**{item['title']}**")
+
+                st.caption(
+                    f"{item['publisher']} · {item['published']}"
+                )
+
+                st.markdown(
+                    f"[Read original article]({item['link']})"
+                )
 
     # -------------------------
     # Forecast
     # -------------------------
-    with st.spinner(
-        "Training and evaluating the model..."
-    ):
+    with st.spinner("Training and evaluating the model..."):
 
         (
             forecast,
@@ -522,7 +521,7 @@ else:
         )
     )
 
-    # Connect historical price to the first forecast point
+    # Connect historical price to the first forecast point.
     fig.add_trace(
         go.Scatter(
             x=[data.index[-1], forecast.index[0]],
@@ -601,23 +600,21 @@ else:
     )
 
     # -------------------------
-    # Limitations
+    # Forecast limitations
     # -------------------------
     st.warning(
         "Experimental research forecast only. The model uses "
-        "historical market features and does not yet use news "
-        "sentiment, political events, company announcements, "
-        "or future market conditions. Recursive forecasts can "
-        "compound errors. The projected line is not a "
-        "confidence interval. Past performance does not "
-        "guarantee future results."
+        "historical market features and does not directly use news "
+        "sentiment, political events, company announcements, or "
+        "future market conditions. Recursive forecasts can compound "
+        "errors. The projected line is not a confidence interval. "
+        "Past performance does not guarantee future results."
     )
 
     # -------------------------
     # Forecast table
     # -------------------------
     with st.expander("View forecast values"):
-
         st.dataframe(
             forecast.to_frame(),
             use_container_width=True
@@ -627,7 +624,6 @@ else:
     # Historical data table
     # -------------------------
     with st.expander("View historical data"):
-
         st.dataframe(
             data.sort_index(ascending=False),
             use_container_width=True
